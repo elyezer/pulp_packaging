@@ -24,9 +24,10 @@
 
 - name: Clone coverage repository
   git:
-    repo: https://github.com/pulp/pulp.git
+    repo: https://github.com/elyezer/pulp.git
     dest: pulp
     depth: 1
+    version: improve-coverage-hook
 
 - name: Install pip package
   action: "{{ ansible_pkg_mgr }} name=python-pip state=latest"
