@@ -6,3 +6,5 @@ moved to https://github.com/pulp/packaging
 
 The Pulp team plans to move the CI files to a new devel repository as well, though that hasn't
 happened yet.
+
+This is a change, another change, something else.
