@@ -38,6 +38,16 @@
     trigger_times: ''
 
 - project:
+    name: pulp-clustered
+    os:
+        - 'rhel7'
+    pulp_version:
+        - '2.13'
+    jobs:
+        - pulp-{pulp_version}-clustered-a-{os}
+        - pulp-{pulp_version}-clustered-b-{os}
+
+- project:
     name: pulp-dev
     os:
         - 'f24'

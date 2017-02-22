@@ -1,0 +1,281 @@
+- job-template:
+    name: 'pulp-{pulp_version}-clustered-a-{os}'
+    node: '{os}-np'
+    properties:
+        - qe-ownership
+    scm:
+        - pulp-packaging-github
+    wrappers:
+        - ansicolor
+        - config-file-provider:
+            files:
+                - file-id: rhn_credentials
+                  variable: RHN_CREDENTIALS
+        - inject:
+            properties-content: |
+                OS={os}
+                PULP_BUILD=stable
+                PULP_VERSION={pulp_version}
+    builders:
+        - shell:
+            !include-raw-escape:
+                - 'ssh-setup.sh'
+                - 'pulp-install.sh'
+        - shell: |
+            sudo firewall-cmd --permanent --add-port=27017/tcp
+            sudo firewall-cmd --reload
+            sudo sed -i 's/\(^[^#]bind_ip.*\)/#\1/' /etc/mongod.conf
+            sudo sed -i 's/\(^[^#]\s\+bindIp.*\)/#\1/' /etc/mongod.conf
+            sudo cat /etc/mongod.conf
+            sudo systemctl restart mongod
+
+            SERVER_A_HOSTNAME="$(hostname --long)"
+            sudo sed -i \
+                -e "s|^# seeds: localhost:27017|seeds: ${{SERVER_A_HOSTNAME}}:27017|" \
+                -e "s|^# url: tcp://localhost:5672|url: tcp://${{SERVER_A_HOSTNAME}}:5672|" \
+                -e "s|^# broker_url: qpid://localhost/|broker_url: qpid://${{SERVER_A_HOSTNAME}}/|" \
+                /etc/pulp/server.conf
+            sudo systemctl restart httpd
+
+            # Create the parameters.txt file
+            echo "SERVER_A_HOSTNAME=${{SERVER_A_HOSTNAME}}" > parameters.txt
+            cp /etc/pki/CA/cacert.pem cacert.pem
+        - inject:
+            properties-file: parameters.txt
+        - trigger-builds:
+            - project:
+                - 'pulp-{pulp_version}-clustered-b-{os}'
+              block: true
+              predefined-parameters: |
+                  SERVER_A_HOSTNAME=$SERVER_A_HOSTNAME
+              block-thresholds:
+                  build-step-failure-threshold: never
+                  unstable-threshold: never
+                  failure-threshold: never
+              parameter-factories:
+                  - factory: binaryfile
+                    parameter-name: SERVER_A_CA_CERT
+                    file-pattern: cacert.pem
+                    no-files-found-action: FAIL
+                  - factory: binaryfile
+                    parameter-name: PUBLIC_KEY
+                    file-pattern: pulp_server_key.pub
+                    no-files-found-action: FAIL
+                  - factory: binaryfile
+                    parameter-name: PRIVATE_KEY
+                    file-pattern: pulp_server_key
+                    no-files-found-action: FAIL
+        # - copyartifact:
+        #     project: pulp-smash-runner
+        #     which-build: specific-build
+        #     build-number: ${{TRIGGERED_BUILD_NUMBER_PULP_SMASH_RUNNER}}
+        #     flatten: true
+        - shell: |
+            if [[ "${{OS}}" =~ "rhel" ]]; then
+                sudo subscription-manager unregister
+                sudo subscription-manager clean
+            fi
+        - capture-logs
+    publishers:
+        # - junit:
+        #     results: junit-report.xml
+        # - cobertura:
+        #     report-file: "coverage.xml"
+        #     targets:
+        #         - files:
+        #             healthy: 10
+        #             unhealthy: 20
+        #             failing: 30
+        #         - method:
+        #             healthy: 50
+        #             unhealthy: 40
+        #             failing: 30
+        - archive:
+            artifacts: "*.tar.gz"
+            allow-empty: true
+        # - email-notify-owners
+        # - irc-notify-all-summary
+        - mark-node-offline
+
+- job-template:
+    name: 'pulp-{pulp_version}-clustered-b-{os}'
+    node: '{os}-np'
+    properties:
+        - qe-ownership
+    parameters:
+        - string:
+            name: SERVER_A_HOSTNAME
+        - file:
+            name: SERVER_A_CA_CERT
+            description: The CA certificate that signed the Pulp apache server on Server A.
+        - file:
+            name: PUBLIC_KEY
+            description: Public SSH key to connect on the server.
+        - file:
+            name: PRIVATE_KEY
+            description: Private SSH key to connect on the server.
+    scm:
+        - pulp-packaging-github
+    wrappers:
+        - ansicolor
+        - config-file-provider:
+            files:
+                - file-id: rhn_credentials
+                  variable: RHN_CREDENTIALS
+        - inject:
+            properties-content: |
+                OS={os}
+                PULP_BUILD=stable
+                PULP_VERSION={pulp_version}
+    builders:
+        - shell: |
+            cp PRIVATE_KEY pulp_server_key
+            chmod 600 pulp_server_key
+            cat PUBLIC_KEY >> ~/.ssh/authorized_keys
+        - shell:
+            !include-raw-escape:
+                - 'pulp-install.sh'
+                - 'pulp-smash-parameters.sh'
+        - inject:
+            properties-file: parameters.txt
+        - shell: |
+            for dir in /etc/pulp /etc/pki/pulp /var/lib/pulp; do
+                sudo fusermount -u "${{dir}}" 2> /dev/null
+                context="$(ssh root@${{SERVER_A_HOSTNAME}} ls -dZ ${{dir}} | awk '{{ print $1 }}')"
+                if [ -f "${{dir}}/server.conf" ]; then
+                    sudo mv "${{dir}}" "${{dir}}.old";
+                fi
+                ls "${{dir}}"
+                sudo mkdir -p "${{dir}}"
+                # TODO: check how to configure ssh here to access the server a
+                sudo sshfs -o "context=\"${{context}}\"" "root@${{SERVER_A_HOSTNAME}}:${{dir}}" "${{dir}}"
+            done
+            sudo cat /etc/pulp/server.conf
+            for service in mongod qpidd; do
+                sudo systemctl stop ${{service}}
+            done
+            for service in httpd pulp_workers pulp_resource_manager pulp_celerybeat; do
+                sudo systemctl restart ${{service}}
+            done
+            sleep 60
+            ssh -i pulp_server_key jenkins@${{SERVER_A_HOSTNAME}} pulp-admin -u admin -p admin status
+            pulp-admin -u admin -p admin status
+
+            cat > ssh_config <<EOF
+            Host ${{SERVER_A_HOSTNAME}} ${{PULP_SMASH_SYSTEM_HOSTNAME}}
+                User jenkins
+                StrictHostKeyChecking no
+                UserKnownHostsFile /dev/null
+                IdentityFile {{SSH_PRIVATE_KEY}}
+                ControlMaster auto
+                ControlPersist 5m
+                ControlPath ~/.ssh/controlmasters/%C
+            EOF
+
+            cat > pulp_smash_settings <<EOF
+            {{
+                "pulp": {{
+                    "version": "${{PULP_SMASH_PULP_VERSION}}",
+                    "auth": ["admin", "admin"]
+                }},
+                "systems": [
+                    {{
+                        "hostname": "${{SERVER_A_HOSTNAME}}",
+                        "roles": {{
+                            "amqp broker": {{
+                                "service": "qpidd"
+                            }},
+                            "api": {{
+                                "scheme": "https",
+                                "verify": "false"
+                            }},
+                            "mongod": {{}},
+                            "pulp celerybeat": {{}},
+                            "pulp cli": {{}},
+                            "pulp resource manager": {{}},
+                            "pulp workers": {{}},
+                            "shell": {{
+                                "transport": "ssh"
+                            }},
+                            "squid": {{}}
+                        }}
+                    }},
+                    {{
+                        "hostname": "${{PULP_SMASH_SYSTEM_HOSTNAME}}",
+                        "roles": {{
+                            "api": {{
+                                "scheme": "https",
+                                "verify": false
+                            }},
+                            "pulp celerybeat": {{}},
+                            "pulp cli": {{}},
+                            "pulp resource manager": {{}},
+                            "pulp workers": {{}},
+                            "shell": {{
+                                "transport": "ssh"
+                            }},
+                            "squid": {{}}
+                        }}
+                    }}
+                ]
+            }}
+            EOF
+        - trigger-builds:
+            - project:
+                - 'pulp-smash-runner'
+              block: true
+              predefined-parameters: |
+                  PULP_SMASH_SYSTEM_HOSTNAME=$PULP_SMASH_SYSTEM_HOSTNAME
+                  PULP_SMASH_PULP_VERSION=$PULP_SMASH_PULP_VERSION
+              block-thresholds:
+                  build-step-failure-threshold: never
+                  unstable-threshold: never
+                  failure-threshold: never
+              parameter-factories:
+                  - factory: binaryfile
+                    parameter-name: PRIVATE_KEY
+                    file-pattern: pulp_server_key
+                    no-files-found-action: FAIL
+                  - factory: binaryfile
+                    parameter-name: CA_CERT
+                    file-pattern: SERVER_A_CA_CERT
+                    no-files-found-action: FAIL
+                  - factory: binaryfile
+                    parameter-name: SSH_CUSTOM_CONFIG
+                    file-pattern: ssh_config
+                    no-files-found-action: FAIL
+                  - factory: binaryfile
+                    parameter-name: PULP_SMASH_CUSTOM_SETTINGS
+                    file-pattern: pulp_smash_settings
+                    no-files-found-action: FAIL
+        - copyartifact:
+            project: pulp-smash-runner
+            which-build: specific-build
+            build-number: ${{TRIGGERED_BUILD_NUMBER_PULP_SMASH_RUNNER}}
+            flatten: true
+        - shell: |
+            if [[ "${{OS}}" =~ "rhel" ]]; then
+                sudo subscription-manager unregister
+                sudo subscription-manager clean
+            fi
+        - capture-logs
+    publishers:
+        # - junit:
+        #     results: junit-report.xml
+        # - cobertura:
+        #     report-file: "coverage.xml"
+        #     targets:
+        #         - files:
+        #             healthy: 10
+        #             unhealthy: 20
+        #             failing: 30
+        #         - method:
+        #             healthy: 50
+        #             unhealthy: 40
+        #             failing: 30
+        # - archive:
+        #     artifacts: "*.tar.gz"
+        #     allow-empty: true
+        # - email-notify-owners
+        # - irc-notify-all-summary
+        - mark-node-offline
