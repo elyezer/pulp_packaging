@@ -4,7 +4,7 @@
   shell: rm -rf pulp-smash
 
 - name: Clone Pulp Smash repository
-  git: repo=https://github.com/PulpQE/pulp-smash.git depth=1 dest=pulp-smash
+  git: repo=https://github.com/elyezer/pulp-smash.git depth=1 dest=pulp-smash version=new-settings
 
 - name: Install required OS packages
   action: "{{ ansible_pkg_mgr }} name={{ item }} state=present"
