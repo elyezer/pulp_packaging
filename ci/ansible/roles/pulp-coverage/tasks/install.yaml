@@ -32,7 +32,7 @@
   action: "{{ ansible_pkg_mgr }} name=python-pip state=latest"
 
 - name: Install coverage package
-  command: pip install -U coverage
+  command: pip install -U git+https://github.com/elyezer/coveragepy.git@billiard-support#egg=coverage
 
 - name: Install the coverage hook
   command: ./coverage_hook install
